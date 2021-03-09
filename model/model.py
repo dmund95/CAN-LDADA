@@ -26,6 +26,24 @@ class FC_BN_ReLU_Domain(nn.Module):
         x = self.relu(x)
         return x
 
+class DPN(nn.Module):
+    def __init__(self, num_domains, feature_extractor='resnet101', 
+                 fx_pretrained=True, fc_hidden_dims=[], frozen=[], 
+                 num_domains_bn=2, dropout_ratio=(0.5,)):
+        super(DPN, self).__init__()
+
+        self.fc5 = nn.Linear(512, 128)
+        self.bn_fc5 = nn.BatchNorm1d(128)
+        self.dp_layer = nn.Linear(128, num_domains)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x, reverse=False):
+        x = self.relu(self.bn_fc5(self.fc5(x)))
+
+        dp_pred = self.dp_layer(x)
+
+        return dp_pred
+
 class DANet(nn.Module):
     def __init__(self, num_classes, feature_extractor='resnet101', 
                  fx_pretrained=True, fc_hidden_dims=[], frozen=[], 

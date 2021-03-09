@@ -6,12 +6,13 @@ from utils.utils import to_cuda, to_onehot
 from torch import optim
 from . import clustering
 from discrepancy.cdd import CDD
+from discrepancy.class_domain_da import class_da_regulizer_soft
 from math import ceil as ceil
 from .base_solver import BaseSolver
 from copy import deepcopy
 
 class CANSolver(BaseSolver):
-    def __init__(self, net, dataloader, bn_domain_map={}, resume=None, **kwargs):
+    def __init__(self, net, dpn, dataloader, bn_domain_map={}, resume=None, **kwargs):
         super(CANSolver, self).__init__(net, dataloader, \
                       bn_domain_map=bn_domain_map, resume=resume, **kwargs)
 
@@ -188,7 +189,7 @@ class CANSolver(BaseSolver):
         self.selected_classes = [labels[0].item() for labels in source_sample_labels]
         assert(self.selected_classes == 
                [labels[0].item() for labels in  samples['Label_target']])
-        return source_samples, source_nums, target_samples, target_nums
+        return source_samples, source_nums, target_samples, target_nums, source_sample_labels
             
     def prepare_feats(self, feats):
         return [feats[key] for key in feats if key in self.opt.CDD.ALIGNMENT_FEAT_KEYS]
@@ -196,6 +197,20 @@ class CANSolver(BaseSolver):
     def compute_iters_per_loop(self, filtered_classes):
         self.iters_per_loop = int(len(self.train_data['categorical']['loader'])) * self.opt.TRAIN.UPDATE_EPOCH_PERCENTAGE
         print('Iterations in one loop: %d' % (self.iters_per_loop))
+
+    def get_one_hot_encoding(self, labels, num_classes):
+        y = torch.eye(num_classes).cuda()
+        return y[labels]
+
+    def get_proper_onehot(self, nums):
+        num_classes = len(nums)
+        start = end = 0
+        labels_list = []
+        for c in range(num_classes):
+            start = end
+            end = start + nums[c]
+            labels_list.extend([c]*nums[c])
+        return self.get_one_hot_encoding(labels_list, num_classes)
 
     def update_network(self, filtered_classes):
         # initial configuration
@@ -213,7 +228,9 @@ class CANSolver(BaseSolver):
 
             # set the status of network
             self.net.train()
+            self.dpn.train()
             self.net.zero_grad()
+            self.dpn.zero_grad()
 
             loss = 0
             ce_loss_iter = 0
@@ -240,7 +257,7 @@ class CANSolver(BaseSolver):
                 # update the network parameters
                 # 1) class-aware sampling
                 source_samples_cls, source_nums_cls, \
-                       target_samples_cls, target_nums_cls = self.CAS()
+                       target_samples_cls, target_nums_cls, source_sample_labels = self.CAS()
 
                 # 2) forward and compute the loss
                 source_cls_concat = torch.cat([to_cuda(samples) 
@@ -255,16 +272,38 @@ class CANSolver(BaseSolver):
 
                 # prepare the features
                 feats_toalign_S = self.prepare_feats(feats_source)
-                feats_toalign_T = self.prepare_feats(feats_target)                 
+                feats_toalign_T = self.prepare_feats(feats_target) 
+
+                domain_logits = self.dpn(feats_source["feats"])
+                domain_logits = domain_logits.reshape(domain_logits.shape[0],self.opt.DATASET.NUM_CLASSES,-1)
+                domain_prob_s = torch.zeros(domain_logits.shape,dtype=torch.float32).cuda()
+
+                kl_loss = 0
+                entropy_loss = 0
+                num_active_classes = 0
+                for i in range(self.opt.DATASET.NUM_CLASSES):
+                    indexes = source_sample_labels == i
+                    if indexes.sum()==0:
+                        continue
+                    entropy_loss_cl, domain_prob_s_cl = self.entropy_loss(domain_logits[indexes,i])
+                    kl_loss += -self.get_domain_entropy(domain_prob_s_cl)
+                    entropy_loss += entropy_loss_cl
+                    domain_prob_s[indexes,i] = domain_prob_s_cl
+                    num_active_classes+=1
+
+                entropy_loss = entropy_loss * 0.01 / num_active_classes
+                kl_loss = kl_loss * 0.01 / num_active_classes
+
+                cdd_loss = class_da_regulizer_soft(False, feats_toalign_S, feats_toalign_T, 5, self.get_proper_onehot(source_nums_cls), self.get_proper_onehot(target_nums_cls), domain_prob_s, None)
 
                 cdd_loss = self.cdd.forward(feats_toalign_S, feats_toalign_T, 
                                source_nums_cls, target_nums_cls)[self.discrepancy_key]
 
-                cdd_loss *= self.opt.CDD.LOSS_WEIGHT
-                cdd_loss.backward()
+                total_loss = cdd_loss*self.opt.CDD.LOSS_WEIGHT + entropy_loss + kl_loss
+                total_loss.backward()
 
-                cdd_loss_iter += cdd_loss
-                loss += cdd_loss
+                cdd_loss_iter += total_loss
+                loss += total_loss
 
             # update the network
             self.optimizer.step()
@@ -300,3 +339,23 @@ class CANSolver(BaseSolver):
             else:
                 stop = False
 
+    def entropy_loss(self, output):
+        criterion = HLoss().cuda()
+        return criterion(output)
+
+    def get_domain_entropy(self, domain_probs):
+        bs, num_domains = domain_probs.size()
+        domain_prob_sum = domain_probs.sum(0)/bs
+        mask = domain_prob_sum.ge(0.000001)
+        domain_prob_sum = domain_prob_sum*mask + (1-mask.int())*1e-5
+        return -(domain_prob_sum*(domain_prob_sum.log())).mean()
+
+class HLoss(nn.Module):
+    def __init__(self):
+        super(HLoss, self).__init__()
+
+    def forward(self, x):
+        domain_prob = F.softmax(x, dim=1)
+        b = F.softmax(x, dim=1) * F.log_softmax(x, dim=1)
+        b = -1.0 * b.mean()
+        return b, domain_prob + 1e-5

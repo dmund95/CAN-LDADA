@@ -93,12 +93,16 @@ def train(args):
                  fc_hidden_dims=cfg.MODEL.FC_HIDDEN_DIMS, 
                  num_domains_bn=num_domains_bn)
 
+    dpn = model.DPN(4*cfg.DATASET.NUM_CLASSES)
+
     net = torch.nn.DataParallel(net)
+    dpn = torch.nn.DataParallel(dpn)
     if torch.cuda.is_available():
        net.cuda()
+       dpn.cuda()
 
     # initialize solver
-    train_solver = Solver(net, dataloaders, bn_domain_map=bn_domain_map, resume=resume_dict)
+    train_solver = Solver(net, dpn, dataloaders, bn_domain_map=bn_domain_map, resume=resume_dict)
 
     # train 
     train_solver.solve()
